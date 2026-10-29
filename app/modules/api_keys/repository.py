@@ -618,6 +618,7 @@ class ApiKeysRepository:
 
     async def reset_expired_limits(self, *, now: datetime) -> int:
         reset_count = 0
+        last_id = 0
         while True:
             result = await self._session.execute(
                 select(
@@ -626,12 +627,14 @@ class ApiKeysRepository:
                     ApiKeyLimit.limit_window,
                 )
                 .where(ApiKeyLimit.reset_at < now)
-                .order_by(ApiKeyLimit.reset_at.asc(), ApiKeyLimit.id.asc())
+                .where(ApiKeyLimit.id > last_id)
+                .order_by(ApiKeyLimit.id.asc())
                 .limit(_EXPIRED_LIMIT_RESET_BATCH_SIZE)
             )
             expired_limits = result.all()
             if not expired_limits:
                 return reset_count
+            last_id = expired_limits[-1].id
 
             for limit in expired_limits:
                 update_result = await self._session.execute(

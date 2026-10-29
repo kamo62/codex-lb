@@ -50,6 +50,35 @@ async def test_reset_expired_limits_counts_successful_updates_without_rowcount()
 
 
 @pytest.mark.asyncio
+async def test_reset_expired_limits_advances_past_rows_that_no_longer_match_update() -> None:
+    session = AsyncMock()
+    repo = ApiKeysRepository(session)
+    now = datetime(2026, 4, 23, 12, 0, 0)
+    expired_limit = SimpleNamespace(id=101, reset_at=now - timedelta(days=2), limit_window=LimitWindow.DAILY)
+    executed_sql: list[str] = []
+
+    async def _execute(statement):
+        executed_sql.append(str(statement))
+        call_index = len(executed_sql)
+        if call_index == 1:
+            return SimpleNamespace(all=lambda: [expired_limit])
+        if call_index == 2:
+            return SimpleNamespace(scalar_one_or_none=lambda: None)
+        if call_index == 3:
+            return SimpleNamespace(all=lambda: [])
+        raise AssertionError(f"unexpected execute call {call_index}")
+
+    session.execute.side_effect = _execute
+
+    reset_count = await repo.reset_expired_limits(now=now)
+
+    assert reset_count == 0
+    assert len(executed_sql) == 3
+    assert "api_key_limits.id >" in executed_sql[0]
+    session.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_upsert_limits_preserves_matched_usage_when_requested() -> None:
     session = AsyncMock()
     existing_reset_at = datetime(2026, 8, 22, 12, 0, 0)
