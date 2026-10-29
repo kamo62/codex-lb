@@ -968,6 +968,7 @@ def _make_bridge_session(
         response_create_gate=asyncio.Semaphore(1),
         queued_request_count=queued_request_count,
         last_used_at=1.0,
+        upstream_opened_at=time.monotonic(),
         idle_ttl_seconds=120.0,
     )
 
