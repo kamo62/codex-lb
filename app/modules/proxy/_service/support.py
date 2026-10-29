@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Literal, NoReturn, Protocol, cast
+from typing import Any, Final, Literal, NoReturn, Protocol, cast
 
 import anyio
 
@@ -1337,6 +1337,11 @@ class _HTTPBridgeOwnerForward:
     key: _HTTPBridgeSessionKey
 
 
+# The upstream websocket has a hard 60-minute lifetime. Retire it early so a
+# prompt-cache bridge never presents an aged socket to the next request.
+HTTP_BRIDGE_UPSTREAM_MAX_AGE_SECONDS: Final = 55.0 * 60.0
+
+
 @dataclass(slots=True)
 class _HTTPBridgeSession:
     key: _HTTPBridgeSessionKey
@@ -1438,20 +1443,27 @@ class _HTTPBridgeSession:
     # apart from "upstream spoke and our matching lost the frame".
     unmatched_upstream_liveness_count: int = 0
 
+    def __post_init__(self) -> None:
+        if self.upstream_opened_at is None:
+            self.upstream_opened_at = self.last_used_at
+
+    def upstream_aged(self, now: float) -> bool:
+        """Whether the upstream socket is near the provider's 60-minute lifetime."""
+        opened_at = self.upstream_opened_at
+        return opened_at is not None and now - opened_at >= HTTP_BRIDGE_UPSTREAM_MAX_AGE_SECONDS
+
     def replace_connection(
         self,
         account: Account,
         headers: dict[str, str],
         upstream: UpstreamWebSocket,
         access_token_expires_at: float | None,
-        upstream_opened_at: float | None = None,
     ) -> None:
         """Replace account-bound transport state as one in-memory operation."""
         self.account = account
         self.headers = headers
         self.upstream = upstream
         self.access_token_expires_at = access_token_expires_at
-        self.upstream_opened_at = upstream_opened_at
 
     def claim_liveness_settlement(self) -> bool:
         """Claim whole-deque settlement for a liveness-failed submitter.
