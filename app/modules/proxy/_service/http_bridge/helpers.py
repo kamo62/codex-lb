@@ -223,6 +223,9 @@ _HTTP_BRIDGE_EVENTLESS_RESPONSE_CREATED_MAX_SECONDS = 60.0
 # attribute, and every consumer reads it through this module at call time.
 HTTP_BRIDGE_IDLE_TTL_SECONDS: Final = 120.0
 HTTP_BRIDGE_CODEX_IDLE_TTL_SECONDS: Final = 900.0
+# The upstream websocket has a hard 60-minute lifetime. Retire it early so a
+# prompt-cache bridge never presents an aged socket to the next request.
+HTTP_BRIDGE_UPSTREAM_MAX_AGE_SECONDS: Final = 55.0 * 60.0
 # Owner-side stuck handoff gate; anchored to the 300s wait Codex Desktop uses.
 HTTP_BRIDGE_STUCK_GATE_RETIRE_AFTER_SECONDS: Final = 300.0
 _HTTP_BRIDGE_MISSING_RESPONSE_CREATED_TIMEOUT_DETAIL = "missing_response_created_timeout"

@@ -9969,6 +9969,24 @@ async def test_prune_http_bridge_session_skips_wedged_session_with_visible_pendi
 
 
 @pytest.mark.asyncio
+async def test_prune_http_bridge_session_retires_aged_upstream_before_idle_ttl() -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    key = proxy_service._HTTPBridgeSessionKey("request", "bridge-aged-upstream", None)
+    session = _make_bridge_session(key=key, key_value="bridge-aged-upstream")
+    session.upstream_opened_at = time.monotonic() - http_bridge_helpers_module.HTTP_BRIDGE_UPSTREAM_MAX_AGE_SECONDS - 1.0
+    session.last_used_at = time.monotonic()
+    session.idle_ttl_seconds = 3600.0
+    service._http_bridge_sessions[key] = session
+
+    async with service._http_bridge_lock:
+        sessions_to_close = service._prune_http_bridge_sessions_locked()
+
+    assert sessions_to_close == [session]
+    assert key not in service._http_bridge_sessions
+    assert session.closed is True
+
+
+@pytest.mark.asyncio
 async def test_get_or_create_http_bridge_session_replaces_live_session_when_account_is_no_longer_assigned(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

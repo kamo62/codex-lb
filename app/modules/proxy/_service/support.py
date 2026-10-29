@@ -1352,6 +1352,9 @@ class _HTTPBridgeSession:
     queued_request_count: int
     last_used_at: float
     idle_ttl_seconds: float
+    # Monotonic time when the current upstream websocket was opened. The
+    # provider retires sockets after 60 minutes even when they remain active.
+    upstream_opened_at: float | None = None
     # Wakes a reader that began an unbounded receive before the first request
     # was enqueued. The reader keeps one receive task alive across wakeups.
     upstream_reader_wakeup: asyncio.Event = field(default_factory=asyncio.Event)
@@ -1441,12 +1444,14 @@ class _HTTPBridgeSession:
         headers: dict[str, str],
         upstream: UpstreamWebSocket,
         access_token_expires_at: float | None,
+        upstream_opened_at: float | None = None,
     ) -> None:
         """Replace account-bound transport state as one in-memory operation."""
         self.account = account
         self.headers = headers
         self.upstream = upstream
         self.access_token_expires_at = access_token_expires_at
+        self.upstream_opened_at = upstream_opened_at
 
     def claim_liveness_settlement(self) -> bool:
         """Claim whole-deque settlement for a liveness-failed submitter.

@@ -69,6 +69,7 @@ from app.modules.proxy._service.http_bridge.activity import _HTTPBridgeActivityM
 from app.modules.proxy._service.http_bridge.helpers import (
     _HTTP_BRIDGE_BACKGROUND_CLOSE_TIMEOUT_SECONDS,
     _HTTP_BRIDGE_INFLIGHT_STARTED_AT_ATTR,
+    HTTP_BRIDGE_UPSTREAM_MAX_AGE_SECONDS,
     _active_http_bridge_instance_ring,
     _alias_fallback_key,
     _durable_bridge_lookup_active_owner,
@@ -1638,6 +1639,12 @@ class _HTTPBridgeMixin(
                 continue
             if pending_count:
                 continue
+            if (
+                session.upstream_opened_at is not None
+                and now - session.upstream_opened_at >= HTTP_BRIDGE_UPSTREAM_MAX_AGE_SECONDS
+            ):
+                stale_keys.append(key)
+                continue
             if now - session.last_used_at < session.idle_ttl_seconds:
                 continue
             stale_keys.append(key)
@@ -1942,6 +1949,7 @@ class _HTTPBridgeMixin(
                 await self._load_balancer.release_account_lease(selected_account_lease)
                 selected_account_lease = None
                 raise
+        connection_opened_at = clock_for(self).monotonic()
         session = _HTTPBridgeSession(
             key=key,
             headers=connect_headers,
@@ -1957,8 +1965,9 @@ class _HTTPBridgeMixin(
             response_create_gate=asyncio.Semaphore(1),
             queued_request_count=0,
             lifecycle_lock=fast_lock(),
-            last_used_at=clock_for(self).monotonic(),
+            last_used_at=connection_opened_at,
             idle_ttl_seconds=idle_ttl_seconds,
+            upstream_opened_at=connection_opened_at,
             codex_session=(affinity.kind == StickySessionKind.CODEX_SESSION or key.affinity_kind == "thread_header"),
             access_token_expires_at=_token_expiry(account, self._encryptor),
             prewarm_lock=fast_lock(),
@@ -2412,7 +2421,13 @@ class _HTTPBridgeMixin(
                     await self._load_balancer.release_account_lease(old_lease)
                     session.account_lease = None
             session.account_lease = selected_account_lease
-            session.replace_connection(account, connect_headers, upstream, _token_expiry(account, self._encryptor))
+            session.replace_connection(
+                account,
+                connect_headers,
+                upstream,
+                _token_expiry(account, self._encryptor),
+                upstream_opened_at=clock_for(self).monotonic(),
+            )
             session.catalog_omission_quota_admission = selection.catalog_omission_quota_admission
             session.upstream_control = _WebSocketUpstreamControl()
             session.closed = False
