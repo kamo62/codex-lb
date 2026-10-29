@@ -1229,6 +1229,17 @@ def test_bounded_event_queue_trips_on_bytes_or_events_and_releases_bytes_on_get(
     big.put_nowait({"type": "end"})
 
 
+def test_native_websocket_queue_accepts_small_bursts_beyond_legacy_frame_cap() -> None:
+    websocket = object.__new__(native_egress_module.NativeEgressWebSocket)
+    websocket._messages = native_egress_module._BoundedWebSocketMessageQueue(max_bytes=128)
+
+    for _ in range(65):
+        websocket._queue_message(native_egress_module.NativeWebSocketMessage(kind="text", text="x"))
+
+    assert websocket._messages.qsize() == 65
+    assert websocket._messages.queued_bytes == 65
+
+
 @pytest.mark.asyncio
 async def test_burst_of_small_events_does_not_trip_the_queue_while_the_consumer_drains(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

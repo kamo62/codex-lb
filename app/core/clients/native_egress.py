@@ -53,7 +53,7 @@ _NATIVE_EVENT_LINE_LIMIT = 24 * 1024 * 1024
 # the shared reader hostage.
 _NATIVE_STREAM_QUEUE_LIMIT = 4096
 _NATIVE_STREAM_QUEUE_BYTES_LIMIT = 32 * 1024 * 1024
-_NATIVE_WEBSOCKET_MESSAGE_QUEUE_LIMIT = 64
+_NATIVE_WEBSOCKET_MESSAGE_QUEUE_BYTES_LIMIT = 32 * 1024 * 1024
 _NATIVE_CANCEL_TIMEOUT_SECONDS = 2.0
 _NATIVE_WEBSOCKET_COMMAND_TIMEOUT_SECONDS = 30.0
 
@@ -209,6 +209,44 @@ class NativeWebSocketMessage:
     event_type: str | None = None
     payload: dict[str, JsonValue] | None = None
     routing: NativeWebSocketRoutingMetadata | None = None
+
+
+def _websocket_message_size(message: NativeWebSocketMessage | BaseException) -> int:
+    if isinstance(message, BaseException):
+        return 0
+    if message.text is not None:
+        return max(1, len(message.text.encode("utf-8")))
+    if message.data is not None:
+        return max(1, len(message.data))
+    if message.close_reason is not None:
+        return max(1, len(message.close_reason.encode("utf-8")))
+    return 1
+
+
+class _BoundedWebSocketMessageQueue(asyncio.Queue[NativeWebSocketMessage | BaseException]):
+    """Bound native websocket bursts by payload bytes, not frame count."""
+
+    def __init__(self, *, max_bytes: int) -> None:
+        # The byte budget is the bound. A zero maxsize keeps a terminal failure
+        # enqueueable even when the payload budget is full.
+        super().__init__(maxsize=0)
+        self._max_bytes = max_bytes
+        self.queued_bytes = 0
+
+    def put_nowait(self, item: NativeWebSocketMessage | BaseException) -> None:
+        size = _websocket_message_size(item)
+        if isinstance(item, NativeWebSocketMessage) and not self.empty() and self.queued_bytes + size > self._max_bytes:
+            raise asyncio.QueueFull
+        super().put_nowait(item)
+
+    def _put(self, item: NativeWebSocketMessage | BaseException) -> None:
+        super()._put(item)
+        self.queued_bytes += _websocket_message_size(item)
+
+    def _get(self) -> NativeWebSocketMessage | BaseException:
+        item = super()._get()
+        self.queued_bytes -= _websocket_message_size(item)
+        return item
 
 
 class NativeEgressClient(Protocol):
@@ -450,8 +488,8 @@ class NativeEgressWebSocket:
         self._request_id = request_id
         self._generation = generation
         self._events = events
-        self._messages: asyncio.Queue[NativeWebSocketMessage | BaseException] = asyncio.Queue(
-            maxsize=_NATIVE_WEBSOCKET_MESSAGE_QUEUE_LIMIT
+        self._messages: asyncio.Queue[NativeWebSocketMessage | BaseException] = _BoundedWebSocketMessageQueue(
+            max_bytes=_NATIVE_WEBSOCKET_MESSAGE_QUEUE_BYTES_LIMIT
         )
         self._pending: dict[str, asyncio.Future[None]] = {}
         self._command_sequence = 0
