@@ -7,7 +7,10 @@ from typing import Any
 
 from app.core.config.settings import get_settings
 from app.db.models import HTTP_BRIDGE_SPOOL_FORMAT_CHUNKS_V2, HTTP_BRIDGE_SPOOL_FORMAT_ROWS_V1
-from app.modules.proxy.durable_bridge_repository import DurableBridgeOperationEventInput
+from app.modules.proxy.durable_bridge_repository import (
+    DurableBridgeOperationEventInput,
+    retain_terminal_operation_append,
+)
 
 logger = logging.getLogger("app.modules.proxy.http_bridge_event_batcher")
 
@@ -180,8 +183,10 @@ class HttpBridgeOperationEventBatcher:
         async with self._lock:
             return [operation_id for operation_id in self._pending if operation_id not in self._closing_operations]
 
-    async def _take_batch(self, operation_id: str) -> list[_PendingOperationEvent]:
+    async def _take_batch(self, operation_id: str, *, attempt: int | None = None) -> list[_PendingOperationEvent]:
         async with self._lock:
+            if attempt is not None and self._operation_attempts.get(operation_id) != attempt:
+                return []
             pending = self._pending.get(operation_id, [])
             batch = pending[: self._batch_size]
             if batch:
@@ -192,9 +197,9 @@ class HttpBridgeOperationEventBatcher:
                 self._pending.pop(operation_id, None)
             return batch
 
-    async def _flush_one(self, operation_id: str) -> None:
+    async def _flush_one(self, operation_id: str, *, attempt: int | None = None) -> None:
         async with self._flush_lock:
-            batch = await self._take_batch(operation_id)
+            batch = await self._take_batch(operation_id, attempt=attempt)
             if not batch:
                 return
             async with self._lock:
@@ -314,6 +319,7 @@ class HttpBridgeOperationEventBatcher:
             ),
             name=f"http-bridge-terminal-spool-{operation_id}",
         )
+        retain_terminal_operation_append(operation_id, append_task)
         self._terminal_append_tasks.add(append_task)
         append_task.add_done_callback(self._terminal_append_done)
         try:
@@ -348,7 +354,9 @@ class HttpBridgeOperationEventBatcher:
         # invalidates the connection mid-statement and the aiosqlite handle can
         # keep its write transaction open, so every later writer fails with
         # ``database is locked`` (issue #1981). Fallback settlement refuses or
-        # overwrites a late commit through ``terminal_append_phase``.
+        # overwrites a late commit through ``terminal_append_phase``. The task's
+        # retained operation fence prevents a retry/reset clearing that phase
+        # until this append has finished.
         await self._clear_operation(operation_id, attempt=attempt)
         logger.info(
             "Timed out persisting HTTP bridge terminal transcript operation_id=%s timeout_seconds=%.1f",
@@ -372,8 +380,10 @@ class HttpBridgeOperationEventBatcher:
         attempt: int,
     ) -> TerminalOperationEventAppendResult:
         try:
-            await self.flush_pending_operation(operation_id=operation_id)
+            await self.flush_pending_operation(operation_id=operation_id, attempt=attempt)
             async with self._lock:
+                if self._operation_attempts.get(operation_id) != attempt:
+                    return TerminalOperationEventAppendResult(persisted=False, settlement_required=True)
                 context = self._contexts.get(operation_id)
                 dropped = operation_id in self._dropped_operations
             if context is None:
@@ -548,11 +558,13 @@ class HttpBridgeOperationEventBatcher:
                 exc_info=True,
             )
 
-    async def flush_pending_operation(self, *, operation_id: str) -> bool:
+    async def flush_pending_operation(self, *, operation_id: str, attempt: int | None = None) -> bool:
         """Drain queued events while retaining the operation context."""
         while True:
-            await self._flush_one(operation_id)
+            await self._flush_one(operation_id, attempt=attempt)
             async with self._lock:
+                if attempt is not None and self._operation_attempts.get(operation_id) != attempt:
+                    return False
                 has_pending = bool(self._pending.get(operation_id))
             if not has_pending:
                 break

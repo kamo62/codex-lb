@@ -897,6 +897,81 @@ async def test_close_owns_terminal_finalize_pending_past_bound(caplog: pytest.Lo
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("spool_format", ["rows_v1", "chunks_v2"])
+async def test_stale_terminal_attempt_does_not_drain_or_read_replacement_context(
+    monkeypatch, spool_format: str
+) -> None:
+    durable = _FakeDurableBridge()
+    batcher = HttpBridgeOperationEventBatcher(
+        durable, max_bytes=1024, spool_format=spool_format, terminal_append_timeout_seconds=0.01
+    )
+    second_started = asyncio.Event()
+    append_unbounded = batcher._append_terminal_event_unbounded
+
+    async def observe_second_attempt(**kwargs):
+        if kwargs["event_text"] == "new-terminal":
+            second_started.set()
+        return await append_unbounded(**kwargs)
+
+    monkeypatch.setattr(batcher, "_append_terminal_event_unbounded", observe_second_attempt)
+    await batcher._flush_lock.acquire()
+    try:
+        first = await batcher.append_terminal_event(
+            operation_id="operation",
+            session_id="old-session",
+            instance_id="instance",
+            owner_epoch=1,
+            event_text="old-terminal",
+            max_bytes=1024,
+            state="failed",
+        )
+        assert first.settlement_required
+        old_tasks = tuple(batcher._terminal_append_tasks)
+        assert len(old_tasks) == 1
+        draining_tasks = []
+        append_batch_name = "append_operation_events" if spool_format == "rows_v1" else "append_operation_event_chunk"
+        append_batch = getattr(durable, append_batch_name)
+
+        async def observe_drain(**kwargs):
+            draining_tasks.append(asyncio.current_task())
+            return await append_batch(**kwargs)
+
+        monkeypatch.setattr(durable, append_batch_name, observe_drain)
+        await batcher.enqueue(
+            operation_id="operation",
+            session_id="new-session",
+            instance_id="instance",
+            owner_epoch=2,
+            event_text="new-created",
+        )
+        batcher._terminal_append_timeout_seconds = 2
+        second = asyncio.create_task(
+            batcher.append_terminal_event(
+                operation_id="operation",
+                session_id="new-session",
+                instance_id="instance",
+                owner_epoch=2,
+                event_text="new-terminal",
+                max_bytes=1024,
+                state="completed",
+            )
+        )
+        await asyncio.wait_for(second_started.wait(), 1)
+    finally:
+        batcher._flush_lock.release()
+    try:
+        assert (await asyncio.wait_for(second, 2)).persisted
+        await asyncio.gather(*old_tasks)
+        assert old_tasks[0] not in draining_tasks
+        assert durable.terminal_chunks == ["new-terminal"]
+        assert durable.terminal_append_kwargs[0]["session_id"] == "new-session"
+        assert durable.batches + durable.chunk_batches == [["new-created"]]
+        assert await batcher.pending_operation_ids() == set()
+    finally:
+        await batcher.close()
+
+
+@pytest.mark.asyncio
 async def test_close_cancels_background_flusher() -> None:
     durable = _FakeDurableBridge()
     batcher = HttpBridgeOperationEventBatcher(

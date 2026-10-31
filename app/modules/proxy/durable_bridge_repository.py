@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections import Counter
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -91,6 +92,23 @@ _HTTP_BRIDGE_TERMINAL_OPERATION_STATES = frozenset({"completed", "incomplete", "
 _HTTP_BRIDGE_TERMINAL_APPEND_RECORDED_PHASES = frozenset(
     {HTTP_BRIDGE_TERMINAL_APPEND_PHASE_APPENDED, HTTP_BRIDGE_TERMINAL_APPEND_PHASE_SETTLED}
 )
+_terminal_appends_in_flight: Counter[str] = Counter()
+
+
+def retain_terminal_operation_append(operation_id: str, task: asyncio.Task[Any]) -> None:
+    """Keep retry/reset fenced until a retained append (including its drain) ends.
+
+    This fence is process-local, like the tasks it owns. Cross-process writes
+    remain fenced by the durable session/owner epoch checked in each write.
+    """
+    _terminal_appends_in_flight[operation_id] += 1
+
+    def release(_task: asyncio.Task[Any]) -> None:
+        _terminal_appends_in_flight[operation_id] -= 1
+        if not _terminal_appends_in_flight[operation_id]:
+            del _terminal_appends_in_flight[operation_id]
+
+    task.add_done_callback(release)
 
 
 # Sentinel: rebind continuity clears without an anchor fence (legacy callers).
@@ -1802,6 +1820,14 @@ class DurableBridgeRepository:
                     ).where(HttpBridgeSessionRecord.api_key_scope == api_key_scope)
                 operation = await self._session.scalar(fingerprint_statement.with_for_update())
             if operation is not None:
+                if _terminal_appends_in_flight[operation.operation_id]:
+                    # Do not clear the terminal phase or rebind an operation
+                    # while its previous append can still commit. Returning the
+                    # unchanged identity uses normal duplicate admission until
+                    # the retained task finishes; never cancel its SQL write.
+                    snapshot = _to_operation_snapshot(operation)
+                    await self._session.rollback()
+                    return snapshot
                 rebound_from_session_id = operation.session_id if operation.state == "failed" else None
                 rebound_from_account_id = operation.account_id if operation.state == "failed" else None
                 rebound_from_model = operation.model if operation.state == "failed" else None
@@ -2176,6 +2202,8 @@ class DurableBridgeRepository:
     ) -> bool:
         """Start a fresh transcript for a server-owned ambiguous retry."""
         async with sqlite_writer_section():
+            if _terminal_appends_in_flight[operation_id]:
+                return False
             owner_exists = await self._session.scalar(
                 select(HttpBridgeSessionRecord.id)
                 .where(
@@ -2227,6 +2255,8 @@ class DurableBridgeRepository:
         write so exactly one caller can move UNKNOWN back to SUBMITTED.
         """
         async with sqlite_writer_section():
+            if _terminal_appends_in_flight[operation_id]:
+                return False
             owner_exists = await self._session.scalar(
                 select(HttpBridgeSessionRecord.id)
                 .where(
