@@ -1442,6 +1442,9 @@ class _HTTPBridgeSession:
     # counter a pre-response bridge timeout cannot tell "upstream said nothing"
     # apart from "upstream spoke and our matching lost the frame".
     unmatched_upstream_liveness_count: int = 0
+    # A terminal event leaves pending ownership before its async bookkeeping
+    # and downstream publication finish. Idle retirement must retain its reader.
+    upstream_events_in_flight: int = 0
 
     def __post_init__(self) -> None:
         if self.upstream_opened_at is None:
@@ -1451,6 +1454,14 @@ class _HTTPBridgeSession:
         """Whether the upstream socket is near the provider's 60-minute lifetime."""
         opened_at = self.upstream_opened_at
         return opened_at is not None and now - opened_at >= HTTP_BRIDGE_UPSTREAM_MAX_AGE_SECONDS
+
+    def idle_retirement_due(self, now: float) -> bool:
+        """Retire only after pending and claimed event ownership is quiescent."""
+        return (
+            not self.pending_requests
+            and self.upstream_events_in_flight == 0
+            and (now - self.last_used_at >= self.idle_ttl_seconds or self.upstream_aged(now))
+        )
 
     def replace_connection(
         self,

@@ -181,6 +181,7 @@ async def test_native_websocket_values_and_policy_match_python(monkeypatch: pyte
                         archive = Mock()
                         harness = SimpleNamespace(_process_parsed_http_bridge_upstream_event=process)
                         session = SimpleNamespace(
+                            upstream_events_in_flight=0,
                             pending_lock=anyio.Lock(),
                             pending_requests=deque(),
                             upstream=SimpleNamespace(archive_received=archive),
@@ -197,6 +198,7 @@ async def test_native_websocket_values_and_policy_match_python(monkeypatch: pyte
                                 scheduler=REAL_SCHEDULER,
                                 clock=REAL_CLOCK,
                             )
+                        assert session.upstream_events_in_flight == 0
                         if expected_bridge_payload is None:
                             process.assert_not_awaited()
                             archive.assert_called_once()

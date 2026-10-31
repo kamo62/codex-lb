@@ -1626,7 +1626,7 @@ class _HTTPBridgeMixin(
         for key, session in self._http_bridge_sessions.items():
             if _http_bridge_session_has_admission_waiter(session):
                 continue
-            if session.handoff_in_progress:
+            if session.handoff_in_progress or session.upstream_events_in_flight:
                 continue
             if session.closed:
                 stale_keys.append(key)
@@ -1638,7 +1638,7 @@ class _HTTPBridgeMixin(
                 continue
             if pending_count:
                 continue
-            if now - session.last_used_at < session.idle_ttl_seconds and not session.upstream_aged(now):
+            if not session.idle_retirement_due(now):
                 continue
             stale_keys.append(key)
         sessions_to_close: list[_HTTPBridgeSession] = []

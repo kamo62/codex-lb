@@ -9974,7 +9974,9 @@ async def test_prune_http_bridge_session_retires_aged_upstream_before_idle_ttl()
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
     key = proxy_service._HTTPBridgeSessionKey("request", "bridge-aged-upstream", None)
     session = _make_bridge_session(key=key, key_value="bridge-aged-upstream")
-    session.upstream_opened_at = time.monotonic() - http_bridge_helpers_module.HTTP_BRIDGE_UPSTREAM_MAX_AGE_SECONDS - 1.0
+    session.upstream_opened_at = (
+        time.monotonic() - http_bridge_helpers_module.HTTP_BRIDGE_UPSTREAM_MAX_AGE_SECONDS - 1.0
+    )
     session.last_used_at = time.monotonic()
     session.idle_ttl_seconds = 3600.0
     service._http_bridge_sessions[key] = session
@@ -9985,6 +9987,116 @@ async def test_prune_http_bridge_session_retires_aged_upstream_before_idle_ttl()
     assert sessions_to_close == [session]
     assert key not in service._http_bridge_sessions
     assert session.closed is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("idle_expired", [False, True])
+@pytest.mark.parametrize("retirement", ["idle", "closed", "capacity"])
+async def test_prune_aged_http_bridge_preserves_claimed_completion_until_delivered(
+    monkeypatch: pytest.MonkeyPatch, idle_expired: bool, retirement: str
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    event_queue: asyncio.Queue[str | None] = asyncio.Queue()
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-aged-completion",
+        response_id="resp-aged-completion",
+        model="gpt-5.4",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        event_queue=event_queue,
+        transport="http",
+        skip_request_log=True,
+    )
+    session = _make_bridge_session(
+        key_value="bridge-aged-completion",
+        pending_requests=deque([request_state]),
+        queued_request_count=1,
+    )
+    session.upstream_opened_at = (
+        time.monotonic() - http_bridge_helpers_module.HTTP_BRIDGE_UPSTREAM_MAX_AGE_SECONDS - 1.0
+    )
+    session.last_used_at = time.monotonic()
+    session.idle_ttl_seconds = 0.0 if idle_expired else 3600.0
+    service._http_bridge_sessions[session.key] = session
+    completion_claimed = asyncio.Event()
+    release_completion = asyncio.Event()
+
+    async def pause_completion_bookkeeping(*args: Any, **kwargs: Any) -> bool:
+        completion_claimed.set()
+        await release_completion.wait()
+        return True
+
+    finalize = AsyncMock()
+    if retirement == "closed":
+        request_state.suppressed_duplicate_tool_call = True
+
+        async def pause_first_upstream_close() -> None:
+            if not completion_claimed.is_set():
+                await pause_completion_bookkeeping()
+
+        monkeypatch.setattr(session.upstream, "close", pause_first_upstream_close)
+    else:
+        monkeypatch.setattr(service, "_register_http_bridge_previous_response_id", pause_completion_bookkeeping)
+    monkeypatch.setattr(service, "_finalize_websocket_request_state", finalize)
+    completion = {
+        "type": "response.completed",
+        "response": {"id": "resp-aged-completion", "object": "response", "status": "completed", "output": []},
+    }
+    reader = asyncio.create_task(service._process_http_bridge_upstream_text(session, json.dumps(completion)))
+    session.upstream_reader = reader
+    try:
+        await asyncio.wait_for(completion_claimed.wait(), timeout=1.0)
+        assert not session.pending_requests
+        assert session.queued_request_count == 0
+        assert request_state.terminal_settlement_phase == "claimed"
+        assert session.upstream_events_in_flight == 1
+        assert session.closed is (retirement == "closed")
+        assert event_queue.empty()
+
+        async with service._http_bridge_lock:
+            if retirement == "capacity":
+                sessions_to_close = []
+                http_bridge_helpers_module._plan_http_bridge_lru_capacity_closes(
+                    service,
+                    max_sessions=1,
+                    model_transition_parent_key=None,
+                    sessions_to_close_before_create=sessions_to_close,
+                )
+            else:
+                sessions_to_close = service._prune_http_bridge_sessions_locked()
+        for stale_session in sessions_to_close:
+            await service._close_http_bridge_session(stale_session)
+
+        release_completion.set()
+        await asyncio.wait_for(asyncio.gather(reader, return_exceptions=True), timeout=1.0)
+        terminal = await asyncio.wait_for(event_queue.get(), timeout=1.0)
+        assert isinstance(terminal, str)
+        delivered = proxy_service.parse_sse_data_json(terminal)
+        if retirement == "closed":
+            assert delivered is not None
+            assert delivered["type"] == "response.failed"
+        else:
+            assert delivered == completion
+        assert await asyncio.wait_for(event_queue.get(), timeout=1.0) is None
+        assert event_queue.empty()
+        assert not reader.cancelled()
+        assert reader.exception() is None
+        finalize.assert_awaited_once()
+        assert sessions_to_close == []
+        assert service._http_bridge_sessions[session.key] is session
+        assert session.closed is (retirement == "closed")
+        assert session.upstream_events_in_flight == 0
+
+        # Age retirement is deferred, not disabled: the now-quiescent session
+        # can close even though the ordinary idle TTL has not elapsed.
+        async with service._http_bridge_lock:
+            assert service._prune_http_bridge_sessions_locked() == [session]
+        assert session.closed
+    finally:
+        release_completion.set()
+        await service._close_http_bridge_session(session)
 
 
 @pytest.mark.asyncio

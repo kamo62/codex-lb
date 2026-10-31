@@ -996,7 +996,7 @@ def _plan_http_bridge_lru_capacity_closes(
                 candidate_session,
                 context="capacity_evict_scan",
             )
-            if pending_count is None or pending_count:
+            if pending_count is None or pending_count or candidate_session.upstream_events_in_flight:
                 continue
             evictable_sessions.append((candidate_key, candidate_session))
         if not evictable_sessions:

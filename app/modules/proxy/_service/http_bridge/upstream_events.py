@@ -2521,6 +2521,7 @@ class _HTTPBridgeUpstreamEventsMixin:
         event = parse_sse_event_payload(payload) if event_type in _LIFECYCLE_EVENT_TYPES else None
         completed_delivery_scope = _HTTPBridgeCompletedDeliveryScope() if event_type == "response.completed" else None
         claimed_terminal_request_states: list[_WebSocketRequestState] = []
+        session.upstream_events_in_flight += 1
         try:
             await self._process_parsed_http_bridge_upstream_event(
                 session,
@@ -2551,6 +2552,7 @@ class _HTTPBridgeUpstreamEventsMixin:
             for claimed_request_state in claimed_terminal_request_states:
                 claimed_request_state.terminal_settlement_phase = None
         finally:
+            session.upstream_events_in_flight -= 1
             if completed_delivery_scope is not None:
                 completed_delivery_scope.active = False
 

@@ -58,6 +58,7 @@ async def test_bridge_parses_complete_websocket_json_documents(
     text = _frame_text(payload, style)
     process = AsyncMock()
     harness = SimpleNamespace(_process_parsed_http_bridge_upstream_event=process)
+    session = SimpleNamespace(upstream_events_in_flight=0)
     response = payload.get("response")
     response_id = response.get("id") if isinstance(response, dict) else None
     assert response_id is None or isinstance(response_id, str)
@@ -71,10 +72,11 @@ async def test_bridge_parses_complete_websocket_json_documents(
     )
 
     await _HTTPBridgeUpstreamEventsMixin._process_http_bridge_upstream_text(
-        harness, cast(Any, None), text, message=message, scheduler=REAL_SCHEDULER, clock=REAL_CLOCK
+        harness, cast(Any, session), text, message=message, scheduler=REAL_SCHEDULER, clock=REAL_CLOCK
     )
 
     process.assert_awaited_once()
+    assert session.upstream_events_in_flight == 0
     assert process.await_args is not None
     parsed = process.await_args.kwargs
     assert parsed["payload"] == payload
@@ -142,6 +144,7 @@ async def test_finite_numbers_and_nonfinite_words_in_strings_are_preserved(nativ
     }
     process = AsyncMock()
     harness = SimpleNamespace(_process_parsed_http_bridge_upstream_event=process)
+    session = SimpleNamespace(upstream_events_in_flight=0)
     text = json.dumps(payload, indent=2)
     message = UpstreamWebSocketMessage(
         kind="text",
@@ -153,10 +156,11 @@ async def test_finite_numbers_and_nonfinite_words_in_strings_are_preserved(nativ
     )
 
     await _HTTPBridgeUpstreamEventsMixin._process_http_bridge_upstream_text(
-        harness, cast(Any, None), text, message=message, scheduler=REAL_SCHEDULER, clock=REAL_CLOCK
+        harness, cast(Any, session), text, message=message, scheduler=REAL_SCHEDULER, clock=REAL_CLOCK
     )
 
     process.assert_awaited_once()
+    assert session.upstream_events_in_flight == 0
     assert process.await_args is not None
     assert process.await_args.kwargs["payload"] == payload
     assert parse_sse_data_json(process.await_args.kwargs["event_block"]) == payload
