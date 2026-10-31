@@ -337,6 +337,27 @@ Canonical background JSON acknowledgements with status `queued` or `in_progress`
 
 Issue #2149 bounds aggregate detached-session lock waiting during request finalization. A sweep shares five seconds: if its first attempt consumes three seconds, the next receives two, and later attempts stop at expiry. Deferred generations remain tracked for later requests and their lifecycle owners. The deadline does not cancel resource-close owners or replace their existing close timeout.
 
+## HTTP bridge terminal-task quiescence
+
+An empty pending queue is not proof of quiescence: a reader claims a terminal
+request before asynchronous bookkeeping and downstream delivery finish. The
+upstream event-processing counter spans that ownership gap. Idle/age sweeps,
+closed-session sweep shortcuts, and LRU capacity eviction retain the reader
+until the event-processing scope exits. For example, duplicate-tool-call
+suppression closes admission before awaiting upstream close and publishing its
+replacement failure; a concurrent sweep must not cancel that publication.
+Explicit error/shutdown resource closure is unchanged.
+
+Terminal spool persistence has separate task ownership. A timed-out append
+continues rather than cancelling an unfinished SQLite statement. A process-local
+reference count follows that append through its drain, write, and cleanup, and
+the repository blocks rebind/reset/recovery of its resolved operation until the
+task finishes. Existing durable session/owner-epoch predicates still fence
+cross-process writes. Thus a retry cannot reset the terminal phase to pending
+while an old `resp-old` append can still commit; after cleanup, a new attempt
+can start a transcript containing only `resp-new` events. Stale in-memory attempt
+tokens also prevent old tasks from draining or reading replacement contexts.
+
 ## Routed file transport failover
 
 File operations follow the existing pre-visible unary retry policy. The file client carries typed dispatch provenance through its service adapter so a refused account-proxy connection can retry another eligible account even though credential-safe transport messages omit low-level details. Typed replay eligibility takes precedence over message text: a proxy endpoint named `timeout-primary` must not turn a TLS verification failure into a retry.
